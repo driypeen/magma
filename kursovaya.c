@@ -22,10 +22,15 @@ typedef enum {
  CM_ENCODE,
 } code_mode_t;
 
+typedef enum {
+   RM_SINGLE,
+   RM_MULTI,
+} run_mode_t;
 
 typedef struct config_t {
   char * file_name;
   code_mode_t code_mode;
+  run_mode_t run_mode;
   char * key;
   u_int32_t * iter_keys;
 } config_t;
@@ -34,6 +39,55 @@ typedef struct block_t {
   u_int32_t left;
   u_int32_t right;
 } block_t;
+
+typedef struct queue_t {
+  block_t queue[8];
+  int head, tail;
+  pthread_mutex_t head_mutex, tail_mutex;
+  sem_t empty, full;
+} queue_t;
+
+typedef struct pc_context_t {
+  config_t * config;
+  queue_t queue;
+  volatile int bytes_read;
+  pthread_mutex_t tiq_mutex;
+  pthread_mutex_t temp_file;
+  pthread_cond_t tiq_cond;
+  size_t file_size;
+  FILE * file;
+  FILE * temp;
+} pc_context_t;
+
+typedef bool (*password_handler_t) (void * context, block_t * task);
+
+void queue_init (queue_t * queue) {
+  queue->head = queue->tail = 0;
+  pthread_mutex_init (&queue->head_mutex, NULL);
+  pthread_mutex_init (&queue->tail_mutex, NULL);
+  sem_init (&queue->empty, 0, QUEUE_SIZE);
+  sem_init (&queue->full, 0, 0);
+}
+
+void queue_push (queue_t * queue, block_t * task) {
+  sem_wait (&queue->empty);
+  pthread_mutex_lock (&queue->tail_mutex);
+  queue->queue[queue->tail] = *task;
+  if (++queue->tail == QUEUE_SIZE)
+    queue->tail = 0;
+  pthread_mutex_unlock (&queue->tail_mutex);  
+  sem_post (&queue->full);
+}
+
+void queue_pop (queue_t * queue, block_t * task) {
+  sem_wait (&queue->full);
+  pthread_mutex_lock (&queue->head_mutex);
+  *task = queue->queue[queue->head];
+  if (++queue->head == QUEUE_SIZE)
+    queue->head = 0;
+  pthread_mutex_unlock (&queue->head_mutex);
+  sem_post (&queue->empty);
+}
 
 const unsigned char Pi[8][16] =
 {
@@ -179,10 +233,6 @@ void get_block (block_t * block, u_int8_t * tmp_block) {
   block->right = block->right | tmp_block[i];
 }
 
-void test () {
-
-}
-
 void transform_T (block_t * block) {
   u_int32_t tmp[32];
   int i;
@@ -277,6 +327,17 @@ void copy_from_temp (FILE * file, FILE * temp, config_t * config, size_t file_si
   }
 }
 
+void iter_keys_create (config_t * config) {
+  u_int32_t tmp;
+  for (int i = 0; i < KEYS_SIZE / 4; i++) {
+    tmp = from_bin_to_dec (config->key, i * KEYS_SIZE, (i + 1) * KEYS_SIZE - 1);
+    config->iter_keys[i] = tmp;
+    config->iter_keys[i + 8] = tmp;
+    config->iter_keys[i + 16] = tmp; 
+    config->iter_keys[KEYS_SIZE - i - 1] = tmp;
+  }
+}
+
 void magma (config_t * config) {
   FILE * file = fopen (config->file_name, "rb");
   FILE * temp;
@@ -289,15 +350,8 @@ void magma (config_t * config) {
     exit (FILE_ERR);
   }
   int i;
-  u_int32_t tmp;
-  for (i = 0; i < KEYS_SIZE / 4; i++) {
-    tmp = from_bin_to_dec (config->key, i * KEYS_SIZE, (i + 1) * KEYS_SIZE - 1);
-    config->iter_keys[i] = tmp;
-    config->iter_keys[i + 8] = tmp;
-    config->iter_keys[i + 16] = tmp; 
-    config->iter_keys[KEYS_SIZE - i - 1] = tmp;
-  }
-  
+  iter_keys_create(config);
+
   struct stat buff;
   fstat (fileno (file), &buff);
   block_t block = {
@@ -317,7 +371,6 @@ void magma (config_t * config) {
       file_size = buff.st_size;
       break;
   }
-
   while (bytes_read < file_size) {   
     memset(tmp_block, 0, sizeof(BLOCK_SIZE / sizeof(u_int8_t)));
     for (i = 0; i < 8; i++) {
@@ -347,6 +400,111 @@ void magma (config_t * config) {
   fclose (temp);
   printf ("%s\n", "Done.");
 }
+////////////////////////////////////////////////
+void * consumer (void * arg) {
+  pc_context_t * pc_context = arg;
+  config_t * config = pc_context->config;
+  int i;
+  u_int32_t half_block;
+  for (;;) {
+      block_t task;
+      queue_pop (&pc_context->queue, &task);
+      magma_block_transform (config, &task);
+      pthread_mutex_lock(&pc_context->temp_file);
+      for (i = 0; i < 4; i++) {
+        half_block = (task.left >> 8 * (3 - i)) & 0xFF;
+        fwrite (&half_block, sizeof(u_int8_t), 1, pc_context->temp);
+      }
+      for (i = 0; i < 4; i++) {
+        half_block = (task.right >> 8 * (3 - i)) & 0xFF;
+        fwrite (&half_block, sizeof(u_int8_t), 1, pc_context->temp);
+      }
+      pthread_mutex_unlock(&pc_context->temp_file);
+
+      pthread_mutex_lock (&pc_context->tiq_mutex);
+      pc_context->bytes_read -= 8;
+      pthread_mutex_unlock (&pc_context->tiq_mutex);
+      
+      if (pc_context->bytes_read <= 0) {
+        printf("signal\n");
+	      pthread_cond_signal (&pc_context->tiq_cond);
+      }
+    }
+}
+////////////////////////////////////////////////
+void magma_multi (config_t * config) {
+  iter_keys_create(config);
+
+  pc_context_t pc_context;
+  pc_context.file = fopen (config->file_name, "rb");
+  if(!(pc_context.temp = tmpfile())) {
+    printf ("Cannot open temporary work file.\n");
+    exit (FILE_ERR);
+  }
+  if (pc_context.file == NULL) {
+    printf ("%s\n", "Cannot open file.");
+    exit (FILE_ERR);
+  }
+
+  int i, num_cpu = sysconf (_SC_NPROCESSORS_ONLN); 
+  pthread_t thread[num_cpu];
+ 
+  pc_context.config = config;
+  pc_context.bytes_read = 0;
+  pthread_mutex_init (&pc_context.tiq_mutex, NULL);
+  pthread_cond_init (&pc_context.tiq_cond, NULL);
+  queue_init (&pc_context.queue);
+  for (i = 0; i < num_cpu; ++i)
+    pthread_create (&thread[i], NULL, consumer, &pc_context);
+
+  struct stat buff;
+  fstat (fileno (pc_context.file), &buff);
+  block_t block = {
+    .left = 0,
+    .right = 0,
+  };
+  u_int8_t * tmp_block = malloc (BLOCK_SIZE / sizeof(u_int8_t));
+
+  switch (config->code_mode) {
+    case CM_DECODE:
+      fread(&pc_context.file_size, sizeof(size_t), 1, pc_context.file);
+      break;
+    case CM_ENCODE:
+      pc_context.file_size = buff.st_size;
+      break;
+  }
+
+  while (pc_context.bytes_read < pc_context.file_size) {   
+    memset(tmp_block, 0, sizeof(BLOCK_SIZE / sizeof(u_int8_t)));
+    for (i = 0; i < 8; i++) {
+      pc_context.bytes_read += fread(&tmp_block[i], 1, 1, pc_context.file);
+    }
+    get_block (&block, tmp_block);
+    queue_push (&pc_context.queue, &block);
+    block.left = 0;
+    block.right = 0;
+  }
+
+  pthread_mutex_lock (&pc_context.tiq_mutex);
+  while (pc_context.bytes_read >= 0) {
+    pthread_cond_wait (&pc_context.tiq_cond, &pc_context.tiq_mutex);
+    //printf("%d\n", pc_context.bytes_read);
+  }
+  for (i = 0; i < num_cpu; ++i) {
+      printf ("%d\n", i);
+      pthread_cancel (thread[i]);
+      pthread_join (thread[i], NULL);
+  }
+  printf("ok2\n");
+  free (tmp_block);
+  fclose (pc_context.file);
+  pc_context.file = fopen (config->file_name, "wb");
+  if (config->code_mode == CM_ENCODE)
+    fwrite (&pc_context.file_size, sizeof(size_t), 1, pc_context.file);
+  
+  copy_from_temp (pc_context.file, pc_context.temp, config, pc_context.file_size);
+  printf ("%s\n", "Done.");
+}
 
 void get_key (char * prepared_key, config_t * config) {
   unsigned int key_length = strlen (prepared_key);
@@ -360,8 +518,7 @@ void get_key (char * prepared_key, config_t * config) {
   }
 }
 
-void parse_params (config_t * config, int argc, char * argv[])
-{
+void parse_params (config_t * config, int argc, char * argv[]) {
   int opt;
   
   while ((opt = getopt(argc, argv, "f:k:edmg")) != -1) {
@@ -377,7 +534,10 @@ void parse_params (config_t * config, int argc, char * argv[])
       break;
     case 'k':
       get_key (optarg, config);     
-      break;      
+      break;    
+    case 'm':
+      config->run_mode = RM_MULTI;
+      break;
     }
   }
 }
@@ -389,6 +549,7 @@ int main (int argc, char * argv[]) {
    .file_name = "testfile.txt",
    .code_mode = CM_ENCODE,
    .iter_keys = malloc (KEYS_SIZE * 4),
+   .run_mode = RM_SINGLE,
   };
   int i;
 
@@ -398,7 +559,16 @@ int main (int argc, char * argv[]) {
   }
 
   parse_params (&config, argc, argv);
-  magma (&config);
+
+  switch (config.run_mode) {
+  case RM_SINGLE:
+    magma (&config);
+    break;
+  case RM_MULTI:
+    magma_multi(&config);
+    break;
+  }
+
   free (config.iter_keys);
   free (config.key);
 }
