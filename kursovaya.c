@@ -179,6 +179,10 @@ void get_block (block_t * block, u_int8_t * tmp_block) {
   block->right = block->right | tmp_block[i];
 }
 
+void test () {
+
+}
+
 void transform_T (block_t * block) {
   u_int32_t tmp[32];
   int i;
