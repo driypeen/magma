@@ -1,4 +1,4 @@
- #include <stdio.h>
+#include <stdio.h>
 #include </usr/include/x86_64-linux-gnu/sys/stat.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -8,23 +8,28 @@
 #include <math.h>
 #include <semaphore.h>
 #include <immintrin.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #define ERR_KEY -11
 #define FILE_ERR -12
-#define BLOCK_SIZE 64
+#define MMAP_ERR -13
+#define BLOCK_SIZE_BITS 64
+#define BLOCK_SIZE_BYTES 8
 #define ENTERED_KEY_LENGTH 64
 #define KEYS_SIZE 32
 #define KEY_LENGTH 256
 #define QUEUE_SIZE 8
 
 typedef enum {
- CM_DECODE,
- CM_ENCODE,
+  CM_DECODE,
+  CM_ENCODE,
 } code_mode_t;
 
 typedef enum {
-   RM_SINGLE,
-   RM_MULTI,
+  RM_SINGLE,
+  RM_MULTI,
 } run_mode_t;
 
 typedef struct config_t {
@@ -38,6 +43,7 @@ typedef struct config_t {
 typedef struct block_t {
   u_int32_t left;
   u_int32_t right;
+  int offset;
 } block_t;
 
 typedef struct queue_t {
@@ -55,11 +61,15 @@ typedef struct pc_context_t {
   pthread_mutex_t temp_file;
   pthread_cond_t tiq_cond;
   size_t file_size;
-  FILE * file;
-  FILE * temp;
+  union {
+    FILE * file;
+    int fdin;
+  };
+  union {
+    FILE * temp;
+    void * dest;
+  };
 } pc_context_t;
-
-typedef bool (*password_handler_t) (void * context, block_t * task);
 
 void queue_init (queue_t * queue) {
   queue->head = queue->tail = 0;
@@ -100,6 +110,18 @@ const unsigned char Pi[8][16] =
   {6,8,2,3,9,10,5,12,1,14,4,7,11,13,0,15},
   {12,4,6,2,10,5,11,9,14,8,13,7,0,3,15,1},
 };
+
+u_int32_t from_bin_to_dec (char * bin_key, u_int8_t first_idx, u_int8_t second_idx) {
+  u_int32_t result = 0;
+  u_int8_t j = 0;
+  for (int i = second_idx; i >= first_idx; i--) {
+    if (bin_key[i] == '1') {
+      result += pow (2, j);
+    }
+    j++;
+  }
+  return result;
+}
 
 char * from_hex_to_bin(char * prepared_key, char * bin) { 
   char a;
@@ -207,18 +229,6 @@ char * from_hex_to_bin(char * prepared_key, char * bin) {
   return bin;
 }
 
-u_int32_t from_bin_to_dec (char * bin_key, u_int8_t first_idx, u_int8_t second_idx) {
-  u_int32_t result = 0;
-  u_int8_t j = 0;
-  for (int i = second_idx; i >= first_idx; i--) {
-    if (bin_key[i] == '1') {
-      result += pow (2, j);
-    }
-    j++;
-  }
-  return result;
-}
-
 void get_block (block_t * block, u_int8_t * tmp_block) {
   int8_t i;
   for (i = 0; i < 3; i++) {
@@ -234,7 +244,7 @@ void get_block (block_t * block, u_int8_t * tmp_block) {
 }
 
 void transform_T (block_t * block) {
-  u_int32_t tmp[32];
+  u_int32_t tmp[8];
   int i;
   tmp[0] = (block->right & 0xF0000000) >> 28;
   tmp[1] = (block->right & 0x0F000000) >> 24;
@@ -255,7 +265,7 @@ void transform_T (block_t * block) {
   }
   
   block->right = tmp[0] | tmp[1] | tmp [2] | tmp[3]
-    | tmp[5] | tmp[5] | tmp[6] | tmp[7];
+    | tmp[4] | tmp[5] | tmp[6] | tmp[7];
 }
 
 void magma_block_transform_iter (config_t * config, block_t * block, size_t idx) {
@@ -358,7 +368,7 @@ void magma (config_t * config) {
     .left = 0,
     .right = 0,
   };
-  u_int8_t * tmp_block = malloc (BLOCK_SIZE / sizeof(u_int8_t));
+  u_int8_t * tmp_block = malloc (BLOCK_SIZE_BITS / sizeof(u_int8_t));
   u_int32_t half_block;
   size_t bytes_read = 0;
   size_t file_size;
@@ -372,12 +382,13 @@ void magma (config_t * config) {
       break;
   }
   while (bytes_read < file_size) {   
-    memset(tmp_block, 0, sizeof(BLOCK_SIZE / sizeof(u_int8_t)));
+    memset(tmp_block, 0, sizeof(BLOCK_SIZE_BITS / sizeof(u_int8_t)));
     for (i = 0; i < 8; i++) {
       bytes_read += fread(&tmp_block[i], 1, 1, file);
     }
-    get_block (&block, tmp_block);
+    get_block (&block, tmp_block);   
     magma_block_transform (config, &block);
+   
     for (i = 0; i < 4; i++) {
       half_block = (block.left >> 8 * (3 - i)) & 0xFF;
       fwrite (&half_block, sizeof(u_int8_t), 1, temp);
@@ -400,109 +411,111 @@ void magma (config_t * config) {
   fclose (temp);
   printf ("%s\n", "Done.");
 }
-////////////////////////////////////////////////
+
 void * consumer (void * arg) {
   pc_context_t * pc_context = arg;
   config_t * config = pc_context->config;
-  int i;
-  u_int32_t half_block;
   for (;;) {
+      if (pc_context->bytes_read <= 0) {
+	      pthread_cond_signal (&pc_context->tiq_cond);
+        printf("signal\n");
+      }
+
       block_t task;
       queue_pop (&pc_context->queue, &task);
+      printf("read %u %u\n", task.left, task.right);
+      
       magma_block_transform (config, &task);
-      pthread_mutex_lock(&pc_context->temp_file);
-      for (i = 0; i < 4; i++) {
-        half_block = (task.left >> 8 * (3 - i)) & 0xFF;
-        fwrite (&half_block, sizeof(u_int8_t), 1, pc_context->temp);
-      }
-      for (i = 0; i < 4; i++) {
-        half_block = (task.right >> 8 * (3 - i)) & 0xFF;
-        fwrite (&half_block, sizeof(u_int8_t), 1, pc_context->temp);
-      }
-      pthread_mutex_unlock(&pc_context->temp_file);
+      printf("write %u %u\n", task.left, task.right);
 
       pthread_mutex_lock (&pc_context->tiq_mutex);
-      pc_context->bytes_read -= 8;
+      pc_context->bytes_read -= BLOCK_SIZE_BYTES;
       pthread_mutex_unlock (&pc_context->tiq_mutex);
       
-      if (pc_context->bytes_read <= 0) {
-        printf("signal\n");
-	      pthread_cond_signal (&pc_context->tiq_cond);
-      }
+      pthread_mutex_lock(&pc_context->temp_file);
+      memcpy(pc_context->dest + task.offset, &task, BLOCK_SIZE_BYTES);
+      pthread_mutex_unlock(&pc_context->temp_file);
     }
 }
-////////////////////////////////////////////////
+
 void magma_multi (config_t * config) {
   iter_keys_create(config);
 
   pc_context_t pc_context;
-  pc_context.file = fopen (config->file_name, "rb");
-  if(!(pc_context.temp = tmpfile())) {
-    printf ("Cannot open temporary work file.\n");
-    exit (FILE_ERR);
-  }
-  if (pc_context.file == NULL) {
+  pc_context.config = config;
+  if ((pc_context.fdin = open(config->file_name, O_RDWR)) < 0) {
     printf ("%s\n", "Cannot open file.");
     exit (FILE_ERR);
   }
 
+  struct stat buff;
+  fstat (pc_context.fdin, &buff);
+  if ((pc_context.dest = mmap(0, buff.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, pc_context.fdin, 0)) == MAP_FAILED) {
+    printf("Cannot mmap source file.\n");
+    exit(MMAP_ERR);
+  }
+
   int i, num_cpu = sysconf (_SC_NPROCESSORS_ONLN); 
   pthread_t thread[num_cpu];
- 
-  pc_context.config = config;
   pc_context.bytes_read = 0;
-  pthread_mutex_init (&pc_context.tiq_mutex, NULL);
-  pthread_cond_init (&pc_context.tiq_cond, NULL);
+  pthread_mutex_init(&pc_context.tiq_mutex, NULL);
+  pthread_cond_init(&pc_context.tiq_cond, NULL);
+  pthread_mutex_init(&pc_context.temp_file, NULL);
   queue_init (&pc_context.queue);
   for (i = 0; i < num_cpu; ++i)
     pthread_create (&thread[i], NULL, consumer, &pc_context);
 
-  struct stat buff;
-  fstat (fileno (pc_context.file), &buff);
   block_t block = {
     .left = 0,
     .right = 0,
   };
-  u_int8_t * tmp_block = malloc (BLOCK_SIZE / sizeof(u_int8_t));
+  u_int8_t * tmp_block = malloc (BLOCK_SIZE_BYTES);
 
   switch (config->code_mode) {
     case CM_DECODE:
-      fread(&pc_context.file_size, sizeof(size_t), 1, pc_context.file);
+      memcpy(&pc_context.file_size, pc_context.dest, sizeof(size_t));
       break;
     case CM_ENCODE:
       pc_context.file_size = buff.st_size;
+      if ((ftruncate(pc_context.fdin, pc_context.file_size + sizeof(size_t))) != 0) {
+        printf("Error in truncate file.\n");
+        exit(FILE_ERR);
+      } 
       break;
   }
 
+  size_t blocks_read = 0;
+  void * pointer = pc_context.dest;
   while (pc_context.bytes_read < pc_context.file_size) {   
-    memset(tmp_block, 0, sizeof(BLOCK_SIZE / sizeof(u_int8_t)));
-    for (i = 0; i < 8; i++) {
-      pc_context.bytes_read += fread(&tmp_block[i], 1, 1, pc_context.file);
-    }
+    memset(tmp_block, 0, BLOCK_SIZE_BYTES);
+    memcpy (tmp_block, pointer + blocks_read * BLOCK_SIZE_BYTES, BLOCK_SIZE_BYTES);
+    
     get_block (&block, tmp_block);
+    block.offset = blocks_read * BLOCK_SIZE_BYTES;
+    blocks_read++;
     queue_push (&pc_context.queue, &block);
+
     block.left = 0;
     block.right = 0;
   }
 
+  if (config->code_mode == CM_ENCODE)
+    memcpy(pc_context.dest, &pc_context.file_size, sizeof(size_t));
+
   pthread_mutex_lock (&pc_context.tiq_mutex);
-  while (pc_context.bytes_read >= 0) {
+  while (pc_context.bytes_read > 0) {
+    printf("%d\n", pc_context.bytes_read);
     pthread_cond_wait (&pc_context.tiq_cond, &pc_context.tiq_mutex);
-    //printf("%d\n", pc_context.bytes_read);
   }
-  for (i = 0; i < num_cpu; ++i) {
-      printf ("%d\n", i);
+  printf("ok1\n");
+  for (i = 0; i < num_cpu; i++) {
+      printf ("kill %d\n", i);
       pthread_cancel (thread[i]);
-      pthread_join (thread[i], NULL);
+      //pthread_join (thread[i], NULL);
   }
   printf("ok2\n");
   free (tmp_block);
-  fclose (pc_context.file);
-  pc_context.file = fopen (config->file_name, "wb");
-  if (config->code_mode == CM_ENCODE)
-    fwrite (&pc_context.file_size, sizeof(size_t), 1, pc_context.file);
   
-  copy_from_temp (pc_context.file, pc_context.temp, config, pc_context.file_size);
   printf ("%s\n", "Done.");
 }
 
